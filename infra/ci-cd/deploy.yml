@@ -1,0 +1,133 @@
+# =============================================
+# AILEX - 자동 배포 워크플로우
+# main 브랜치 push 시 Vercel에 프로덕션 배포
+# =============================================
+
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+# 동시 배포 방지 - 같은 브랜치의 이전 배포를 취소
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+jobs:
+  # ---- 1단계: 코드 검증 ----
+  validate:
+    name: Validate Code
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./project
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: project/package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci
+
+      # 린트, 타입 체크, 테스트를 병렬로 실행할 수 없으므로 순차 실행
+      - name: Lint
+        run: npx eslint .
+
+      - name: Type Check
+        run: npx tsc --noEmit
+
+      - name: Run Tests
+        run: npx vitest run
+
+  # ---- 2단계: Vercel 프로덕션 배포 ----
+  deploy:
+    name: Deploy to Vercel
+    runs-on: ubuntu-latest
+    needs: validate
+    defaults:
+      run:
+        working-directory: ./project
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+
+      # Vercel 프로젝트 설정 pull
+      - name: Pull Vercel Environment
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      # 프로덕션 빌드
+      - name: Build Project
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+
+      # 프로덕션 배포
+      - name: Deploy to Production
+        id: deploy
+        run: |
+          DEPLOYMENT_URL=$(vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
+          echo "url=$DEPLOYMENT_URL" >> $GITHUB_OUTPUT
+          echo "## 배포 완료" >> $GITHUB_STEP_SUMMARY
+          echo "URL: $DEPLOYMENT_URL" >> $GITHUB_STEP_SUMMARY
+
+      # 배포 후 헬스 체크
+      - name: Health Check
+        run: |
+          echo "배포 URL: ${{ steps.deploy.outputs.url }}"
+          sleep 10
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ steps.deploy.outputs.url }}")
+          if [ "$STATUS" -ne 200 ]; then
+            echo "헬스 체크 실패: HTTP $STATUS"
+            exit 1
+          fi
+          echo "헬스 체크 통과: HTTP $STATUS"
+
+  # ---- 3단계: 배포 결과 알림 ----
+  notify:
+    name: Notify Result
+    runs-on: ubuntu-latest
+    needs: [validate, deploy]
+    if: always()
+
+    steps:
+      - name: Send Slack Notification (성공)
+        if: needs.deploy.result == 'success'
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "AILEX 프로덕션 배포 성공\n커밋: ${{ github.event.head_commit.message }}\n작성자: ${{ github.actor }}"
+            }
+
+      - name: Send Slack Notification (실패)
+        if: needs.validate.result == 'failure' || needs.deploy.result == 'failure'
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "AILEX 프로덕션 배포 실패\n커밋: ${{ github.event.head_commit.message }}\n워크플로우: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }

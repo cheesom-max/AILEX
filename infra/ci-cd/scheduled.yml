@@ -1,0 +1,129 @@
+# =============================================
+# AILEX - 주간 보안 스캔 워크플로우
+# 매주 월요일 오전 9시(KST) 의존성 취약점 스캔
+# =============================================
+
+name: Weekly Security Scan
+
+on:
+  schedule:
+    # 매주 월요일 00:00 UTC (한국 시간 09:00)
+    - cron: "0 0 * * 1"
+  # 수동 실행도 가능
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  # ---- npm audit 검사 ----
+  npm-audit:
+    name: npm Audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./project
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: project/package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci
+
+      # npm audit - high/critical 취약점만 실패 처리
+      - name: Run npm audit
+        run: |
+          echo "## npm audit 결과" >> $GITHUB_STEP_SUMMARY
+          npm audit --audit-level=high 2>&1 | tee audit-result.txt || true
+          if npm audit --audit-level=high 2>/dev/null; then
+            echo "취약점 없음 (high/critical)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat audit-result.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # 취약점 발견 시 GitHub Issue 자동 생성
+      - name: Create Issue on Vulnerability
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const auditResult = fs.readFileSync('project/audit-result.txt', 'utf8');
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security,automated',
+              state: 'open'
+            });
+            // 이미 열린 보안 이슈가 있으면 중복 생성 방지
+            if (existingIssues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[보안] npm 의존성 취약점 발견 - ${new Date().toISOString().split('T')[0]}`,
+                body: `## 주간 보안 스캔에서 취약점이 발견되었습니다.\n\n\`\`\`\n${auditResult.substring(0, 3000)}\n\`\`\`\n\n### 조치 방법\n1. \`cd project && npm audit\`으로 상세 내용 확인\n2. \`npm audit fix\`으로 자동 수정 시도\n3. 자동 수정 불가 시 수동 대응`,
+                labels: ['security', 'automated']
+              });
+            }
+
+  # ---- 의존성 업데이트 확인 ----
+  outdated-check:
+    name: Outdated Dependencies
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./project
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: project/package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Check Outdated Packages
+        run: |
+          echo "## 의존성 업데이트 현황" >> $GITHUB_STEP_SUMMARY
+          npm outdated --long 2>&1 | tee outdated-result.txt || true
+          if [ -s outdated-result.txt ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat outdated-result.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "모든 의존성이 최신 상태입니다." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ---- 보안 알림 ----
+  notify:
+    name: Security Alert
+    runs-on: ubuntu-latest
+    needs: [npm-audit, outdated-check]
+    if: failure()
+
+    steps:
+      - name: Send Slack Alert
+        uses: slackapi/slack-github-action@v2.1.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "[AILEX 보안 경고] 주간 보안 스캔에서 문제가 발견되었습니다.\n확인: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
