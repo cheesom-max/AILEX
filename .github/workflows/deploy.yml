@@ -112,7 +112,7 @@ jobs:
     steps:
       - name: Send Slack Notification (성공)
         if: needs.deploy.result == 'success'
-        uses: slackapi/slack-github-action@v2.1.0
+        uses: slackapi/slack-github-action@v2.1.1
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
@@ -123,7 +123,7 @@ jobs:
 
       - name: Send Slack Notification (실패)
         if: needs.validate.result == 'failure' || needs.deploy.result == 'failure'
-        uses: slackapi/slack-github-action@v2.1.0
+        uses: slackapi/slack-github-action@v2.1.1
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
